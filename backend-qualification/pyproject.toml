@@ -1,0 +1,26 @@
+[project]
+name = "plane-backend-qualification"
+version = "0.1.0"
+description = "Behavioral qualification of Plane backend Redis TLS, notification recovery and startup cache safety"
+requires-python = "==3.12.*"
+dependencies = [
+  "Django==5.2.15",
+  "dj-database-url==3.0.1",
+  "django-cors-headers==4.9.0",
+  "django-redis==7.0.0",
+  "redis==5.0.4",
+  "celery==5.5.3",
+]
+
+[dependency-groups]
+dev = ["pytest==8.4.2"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: needs OpenSSL and a real redis-server",
+]
+addopts = "-ra"

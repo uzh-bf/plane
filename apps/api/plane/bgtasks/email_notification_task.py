@@ -4,7 +4,9 @@
 
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
+from smtplib import SMTPDataError, SMTPRecipientsRefused
+from urllib.parse import urlsplit
 
 from bs4 import BeautifulSoup
 
@@ -14,6 +16,7 @@ from django.core.mail import EmailMultiAlternatives, get_connection
 from django.template.loader import render_to_string
 
 # Django imports
+from django.conf import settings
 from django.utils import timezone
 
 # Module imports
@@ -45,15 +48,21 @@ def release_lock(lock_id):
 
 @shared_task
 def stack_email_notification():
+    # Reclaim unsent work after a lost task or worker crash. The lease exceeds
+    # the five-minute send lock and is renewed before each publication attempt.
+    EmailNotificationLog.objects.filter(
+        sent_at__isnull=True, processed_at__lte=timezone.now() - timedelta(minutes=10)
+    ).update(processed_at=None)
     # get all email notifications
-    email_notifications = EmailNotificationLog.objects.filter(processed_at__isnull=True).order_by("receiver").values()
+    email_notifications = (
+        EmailNotificationLog.objects.filter(processed_at__isnull=True, sent_at__isnull=True).order_by("receiver").values()
+    )
 
     # Create the below format for each of the issues
     # {"issue_id" : { "actor_id1": [ { data }, { data } ], "actor_id2": [ { data }, { data } ] }}
 
     # Convert to unique receivers list
     receivers = list(set([str(notification.get("receiver_id")) for notification in email_notifications]))
-    processed_notifications = []
     # Loop through all the issues to create the emails
     for receiver_id in receivers:
         # Notification triggered for the receiver
@@ -62,26 +71,31 @@ def stack_email_notification():
         ]
         # create payload for all issues
         payload = {}
-        email_notification_ids = []
+        email_notification_ids = {}
         for receiver_notification in receiver_notifications:
             payload.setdefault(receiver_notification.get("entity_identifier"), {}).setdefault(
                 str(receiver_notification.get("triggered_by_id")), []
             ).append(receiver_notification.get("data"))
-            # append processed notifications
-            processed_notifications.append(receiver_notification.get("id"))
-            email_notification_ids.append(receiver_notification.get("id"))
+            email_notification_ids.setdefault(receiver_notification.get("entity_identifier"), []).append(
+                receiver_notification.get("id")
+            )
 
         # Create emails for all the issues
         for issue_id, notification_data in payload.items():
-            send_email_notification.delay(
-                issue_id=issue_id,
-                notification_data=notification_data,
-                receiver_id=receiver_id,
-                email_notification_ids=email_notification_ids,
-            )
-
-    # Update the email notification log
-    EmailNotificationLog.objects.filter(pk__in=processed_notifications).update(processed_at=timezone.now())
+            ids = email_notification_ids[issue_id]
+            # Mark before publishing so a fast failing sender can restore eligibility.
+            pending = EmailNotificationLog.objects.filter(pk__in=ids, sent_at__isnull=True)
+            pending.update(processed_at=timezone.now())
+            try:
+                send_email_notification.delay(
+                    issue_id=issue_id,
+                    notification_data=notification_data,
+                    receiver_id=receiver_id,
+                    email_notification_ids=ids,
+                )
+            except Exception:
+                pending.update(processed_at=None)
+                raise
 
 
 def create_payload(notification_data):
@@ -149,6 +163,35 @@ def process_html_content(content):
     return processed_content_list
 
 
+def notification_origin(cached_origin):
+    for candidate in (cached_origin, settings.WEB_URL):
+        if isinstance(candidate, bytes):
+            try:
+                candidate = candidate.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+        if not isinstance(candidate, str) or any(
+            char.isspace() or ord(char) < 32 or ord(char) == 127 for char in candidate
+        ):
+            continue
+        try:
+            parsed = urlsplit(candidate)
+            if (
+                parsed.scheme in ("http", "https")
+                and parsed.hostname
+                and parsed.port != 0
+                and parsed.username is None
+                and parsed.password is None
+                and not parsed.query
+                and not parsed.fragment
+                and "\\" not in candidate
+            ):
+                return candidate.rstrip("/")
+        except ValueError:
+            continue
+    raise ValueError("A valid HTTP(S) WEB_URL is required for notification links")
+
+
 @shared_task
 def send_email_notification(issue_id, notification_data, receiver_id, email_notification_ids):
     # Convert UUIDs to a sorted, concatenated string
@@ -157,15 +200,15 @@ def send_email_notification(issue_id, notification_data, receiver_id, email_noti
     lock_id = f"send_email_notif_{issue_id}_{receiver_id}_{ids_str}"
 
     # acquire the lock for sending emails
+    locked = False
     try:
         if acquire_lock(lock_id=lock_id):
+            locked = True
+            if not EmailNotificationLog.objects.filter(pk__in=email_notification_ids, sent_at__isnull=True).exists():
+                return
             # get the redis instance
             ri = redis_instance()
-            base_api = ri.get(str(issue_id)).decode() if ri.get(str(issue_id)) else None
-
-            # Skip if base api is not present
-            if not base_api:
-                return
+            base_api = notification_origin(ri.get(str(issue_id)))
 
             data = create_payload(notification_data=notification_data)
 
@@ -262,45 +305,53 @@ def send_email_notification(issue_id, notification_data, receiver_id, email_noti
             html_content = render_to_string("emails/notifications/issue-updates.html", context)
             text_content = generate_plain_text_from_html(html_content)
 
-            try:
-                connection = get_connection(
-                    host=EMAIL_HOST,
-                    port=int(EMAIL_PORT),
-                    username=EMAIL_HOST_USER,
-                    password=EMAIL_HOST_PASSWORD,
-                    use_tls=EMAIL_USE_TLS == "1",
-                    use_ssl=EMAIL_USE_SSL == "1",
-                )
+            connection = get_connection(
+                host=EMAIL_HOST,
+                port=int(EMAIL_PORT),
+                username=EMAIL_HOST_USER,
+                password=EMAIL_HOST_PASSWORD,
+                use_tls=EMAIL_USE_TLS == "1",
+                use_ssl=EMAIL_USE_SSL == "1",
+            )
 
-                msg = EmailMultiAlternatives(
-                    subject=subject,
-                    body=text_content,
-                    from_email=EMAIL_FROM,
-                    to=[receiver.email],
-                    connection=connection,
-                )
-                msg.attach_alternative(html_content, "text/html")
-                msg.send()
-                logging.getLogger("plane.worker").info("Email Sent Successfully")
+            msg = EmailMultiAlternatives(
+                subject=subject,
+                body=text_content,
+                from_email=EMAIL_FROM,
+                to=[receiver.email],
+                connection=connection,
+            )
+            msg.attach_alternative(html_content, "text/html")
+            if msg.send() != 1:
+                raise RuntimeError("Notification email was not sent")
+            logging.getLogger("plane.worker").info("Email Sent Successfully")
 
-                # Update the logs
-                EmailNotificationLog.objects.filter(pk__in=email_notification_ids).update(sent_at=timezone.now())
-
-                # release the lock
-                release_lock(lock_id=lock_id)
-                return
-            except Exception as e:
-                log_exception(e)
-                # release the lock
-                release_lock(lock_id=lock_id)
-                return
+            # Update the logs
+            EmailNotificationLog.objects.filter(pk__in=email_notification_ids).update(sent_at=timezone.now())
+            return
         else:
             logging.getLogger("plane.worker").info("Duplicate email received skipping")
             return
     except (Issue.DoesNotExist, User.DoesNotExist):
-        release_lock(lock_id=lock_id)
+        EmailNotificationLog.objects.filter(pk__in=email_notification_ids, sent_at__isnull=True).update(
+            deleted_at=timezone.now()
+        )
         return
-    except Exception as e:
+    except (SMTPRecipientsRefused, SMTPDataError) as e:
+        codes = [code for code, _ in e.recipients.values()] if isinstance(e, SMTPRecipientsRefused) else [e.smtp_code]
+        if codes and all(500 <= int(code) < 600 for code in codes):
+            EmailNotificationLog.objects.filter(pk__in=email_notification_ids, sent_at__isnull=True).update(
+                deleted_at=timezone.now()
+            )
+            log_exception(e)
+            return
+        EmailNotificationLog.objects.filter(pk__in=email_notification_ids, sent_at__isnull=True).update(processed_at=None)
         log_exception(e)
-        release_lock(lock_id=lock_id)
-        return
+        raise
+    except Exception as e:
+        EmailNotificationLog.objects.filter(pk__in=email_notification_ids, sent_at__isnull=True).update(processed_at=None)
+        log_exception(e)
+        raise
+    finally:
+        if locked:
+            release_lock(lock_id=lock_id)

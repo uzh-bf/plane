@@ -20,6 +20,7 @@ from corsheaders.defaults import default_headers
 
 
 # Module imports
+from plane.settings.redis import redis_tls_kwargs, redis_url_for_client, redis_url_is_tls
 from plane.utils.url import is_valid_url
 
 
@@ -240,16 +241,19 @@ if os.environ.get("ENABLE_READ_REPLICA", "0") == "1":
 
 # Redis Config
 REDIS_URL = os.environ.get("REDIS_URL")
-REDIS_SSL = REDIS_URL and "rediss" in REDIS_URL
+# Optional CA bundle for a private Redis CA (mounted into the API and worker
+# images); the system trust store applies when this is unset.
+REDIS_SSL_CA_CERTS = os.environ.get("REDIS_SSL_CA_CERTS") or None
+REDIS_SSL = redis_url_is_tls(REDIS_URL)
 
 if REDIS_SSL:
     CACHES = {
         "default": {
             "BACKEND": "django_redis.cache.RedisCache",
-            "LOCATION": REDIS_URL,
+            "LOCATION": redis_url_for_client(REDIS_URL),
             "OPTIONS": {
                 "CLIENT_CLASS": "django_redis.client.DefaultClient",
-                "CONNECTION_POOL_KWARGS": {"ssl_cert_reqs": False},
+                "CONNECTION_POOL_KWARGS": redis_tls_kwargs(REDIS_SSL_CA_CERTS),
             },
         }
     }

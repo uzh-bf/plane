@@ -1,0 +1,119 @@
+name: UZH qualified ARM64 backend
+
+on:
+  push:
+    branches:
+      - rs/backend-v1.4.2-uzh.1
+
+permissions: {}
+
+concurrency:
+  group: uzh-plane-backend-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.repository == 'uzh-bf/plane'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      UPSTREAM_REVISION: 5f7d92784c403f76284f0f16718f320221dc7fec
+      IMAGE: ghcr.io/uzh-bf/plane-community-backend:git-${{ github.sha }}-run-${{ github.run_id }}
+    steps:
+      - name: Fetch the immutable public source
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test "$(uname -m)" = aarch64
+          git clone --filter=blob:none --no-checkout https://github.com/uzh-bf/plane.git source
+          git -C source fetch origin "$GITHUB_SHA"
+          git -C source checkout --detach "$GITHUB_SHA"
+          git -C source merge-base --is-ancestor "$UPSTREAM_REVISION" HEAD
+
+      - name: Qualify the accepted patch
+        run: |
+          set -euo pipefail
+          baseline_dir=$(mktemp -d "$RUNNER_TEMP/plane-upstream.XXXXXX")
+          evidence_dir=$(mktemp -d "$RUNNER_TEMP/plane-contracts.XXXXXX")
+          git archive "$UPSTREAM_REVISION" | tar -x -C "$baseline_dir"
+          docker run --rm --platform linux/arm64 \
+            --volume "$PWD/backend-qualification:/qualification:ro" \
+            --volume "$baseline_dir:/upstream:ro" \
+            --volume "$evidence_dir:/evidence" \
+            --workdir /qualification \
+            --env PLANE_SOURCE_DIR=/upstream \
+            --env UV_PROJECT_ENVIRONMENT=/tmp/qualification-venv \
+            --env UV_CACHE_DIR=/tmp/qualification-cache \
+            --env PYTHONDONTWRITEBYTECODE=1 \
+            ghcr.io/astral-sh/uv@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58 \
+            sh -euc '
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends patch redis-server openssl ca-certificates
+              test -f /upstream/apps/api/plane/settings/redis.py
+              uv sync --locked
+              uv lock --check
+              uvx --from ruff==0.15.11 ruff check --no-cache tests/test_backend_contracts.py
+              uvx --from ruff==0.15.11 ruff format --no-cache --check tests/test_backend_contracts.py
+              uv run --locked pytest -p no:cacheprovider -q --junitxml=/evidence/contracts.xml
+            '
+          python3 - "$evidence_dir/contracts.xml" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          suites = list(ET.parse(sys.argv[1]).getroot().iter('testsuite'))
+          assert sum(int(s.get('tests', 0)) for s in suites) > 0
+          assert all(int(s.get(k, 0)) == 0 for s in suites for k in ('failures', 'errors', 'skipped'))
+          PY
+
+      - name: Build and inspect the ARM64 image
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import ast
+          import hashlib
+          from pathlib import Path
+          tree = ast.parse(Path('backend-qualification/tests/test_backend_contracts.py').read_text())
+          hashes = next(ast.literal_eval(n.value) for n in tree.body
+                        if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
+                        and n.targets[0].id == 'PATCHED_SHA256')
+          for name, expected in hashes.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != expected:
+                  raise SystemExit(f'Derivative source differs from qualified patch: {name}')
+          PY
+          patch_hash=$(sha256sum backend-qualification/backend.patch | cut -d ' ' -f 1)
+          dockerfile_hash=$(sha256sum backend-qualification/Dockerfile | cut -d ' ' -f 1)
+          docker build --platform linux/arm64 \
+            --label org.opencontainers.image.source=https://github.com/uzh-bf/plane \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.url=https://github.com/uzh-bf/plane/tree/$GITHUB_SHA" \
+            --label "ch.df.upstream.revision=$UPSTREAM_REVISION" \
+            --label "ch.df.patch.sha256=$patch_hash" \
+            --label "ch.df.dockerfile.sha256=$dockerfile_hash" \
+            --label "ch.df.build.url=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --tag "$IMAGE" backend-qualification
+          test "$(docker image inspect --format '{{.Architecture}}' "$IMAGE")" = arm64
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.source"}}' "$IMAGE")" = https://github.com/uzh-bf/plane
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")" = "$GITHUB_SHA"
+
+      - name: Publish the qualified image
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          trap 'docker logout ghcr.io >/dev/null 2>&1' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE")
+          case "$digest" in
+            ghcr.io/uzh-bf/plane-community-backend@sha256:*) ;;
+            *) exit 1 ;;
+          esac
+          printf 'Image: %s\n\nSource: https://github.com/uzh-bf/plane/archive/%s.tar.gz\n' "$digest" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+          printf '\nPackage visibility and anonymous digest/source access still require verification before admission.\n' >> "$GITHUB_STEP_SUMMARY"

@@ -8,7 +8,7 @@ from django.core.management import BaseCommand
 
 
 class Command(BaseCommand):
-    help = "Clear Cache before starting the server to remove stale values"
+    help = "Clear an explicitly named cache key while preserving shared Redis state"
 
     def add_arguments(self, parser):
         # Positional argument
@@ -21,8 +21,7 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.SUCCESS(f"Cache Cleared for key: {options['key']}"))
                 return
 
-            cache.clear()
-            self.stdout.write(self.style.SUCCESS("Cache Cleared"))
+            self.stdout.write(self.style.WARNING("No cache key specified; shared Redis state preserved"))
             return
         except Exception:
             # Another ClientError occurred

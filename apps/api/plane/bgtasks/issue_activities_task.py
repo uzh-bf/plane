@@ -1526,9 +1526,12 @@ def issue_activity(
 
         if issue_id is not None:
             if origin:
-                ri = redis_instance()
                 # set the request origin in redis
-                ri.set(str(issue_id), origin, ex=600)
+                try:
+                    ri = redis_instance()
+                    ri.set(str(issue_id), origin, ex=600)
+                except Exception as e:
+                    log_exception(e)
             issue = Issue.objects.filter(pk=issue_id).first()
             if issue:
                 try:
